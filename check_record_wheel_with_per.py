@@ -6,28 +6,26 @@ import math
 import argparse
 import sys
 import time
+import os
 
 try:
     import psutil
 except ImportError:
-    print("[LỖI] Thư viện 'psutil' chưa được cài đặt.")
-    print("Vui lòng mở terminal và chạy lệnh: pip install psutil")
+    print("Vui lòng chạy: pip install psutil")
     sys.exit(1)
 
-
-class TrajectoryRecorder(Node):
+class ObjectiveTrajectoryRecorder(Node):
     def __init__(self, topic_name, output_file):
-        super().__init__('trajectory_recorder')
+        super().__init__('objective_recorder')
         self.output_file = output_file
         
-        # Đăng ký lắng nghe topic. 
-        # NẾU TYPE KHÁC TWIST, BẠN CẦN SỬA KIỂU DỮ LIỆU Ở ĐÂY!
         self.subscription = self.create_subscription(
             Twist,  
             topic_name,
             self.listener_callback,
             10)
         
+        # Biến quỹ đạo
         self.pose_x = 0.0
         self.pose_y = 0.0
         self.pose_theta = 0.0
@@ -35,34 +33,22 @@ class TrajectoryRecorder(Node):
         
         self.trajectory_data = [("x", "y")]
 
-        # --- BỘ BIẾN THEO DÕI CHI PHÍ TÍNH TOÁN (CPU/RAM) ---
-        self.cpu_records = []
-        self.ram_records = []
-        self.start_time = time.time()
+        # --- BỘ ĐO KHÁCH QUAN CẤP TIẾN TRÌNH (PROCESS LEVEL) ---
+        self.current_process = psutil.Process(os.getpid())
+        self.process_time_records = []
+        self.memory_mb_records = []
         
-        # Tạo một Timer để lấy mẫu tài nguyên máy tính mỗi 1.0 giây
-        self.profile_timer = self.create_timer(1.0, self.profile_system_callback)
-        # Lần gọi đầu tiên để khởi tạo baseline cho CPU
-        psutil.cpu_percent(interval=None)
-
-        self.get_logger().info(f"Đang ghi quỹ đạo từ '{topic_name}' vào '{self.output_file}'...")
-        self.get_logger().info("Đang theo dõi chi phí tính toán hệ thống (CPU & RAM)...")
-        self.get_logger().info("Nhấn Ctrl+C để kết thúc và lưu báo cáo.")
-
-    def profile_system_callback(self):
-        """Lấy mẫu phần trăm sử dụng CPU và RAM của toàn bộ máy tính."""
-        # interval=None giúp hàm không bị block (chờ đợi), phù hợp với môi trường ROS 2
-        current_cpu = psutil.cpu_percent(interval=None)
-        current_ram = psutil.virtual_memory().percent
-        
-        self.cpu_records.append(current_cpu)
-        self.ram_records.append(current_ram)
+        self.get_logger().info(f"Đang ghi dữ liệu từ '{topic_name}' vào '{self.output_file}'...")
+        self.get_logger().info("Đang theo dõi chi phí tính toán ĐỘC LẬP của tiến trình này...")
 
     def listener_callback(self, msg):
+        # 1. Bắt đầu đo thời gian CPU thực thi dành riêng cho tiến trình này
+        t_start = time.process_time()
+
+        # --- PHẦN TÍNH TOÁN CỦA THUẬT TOÁN (Ghi nhận quỹ đạo) ---
         current_time = self.get_clock().now()
         dt = (current_time - self.last_time).nanoseconds / 1e9
         
-        # Trích xuất dữ liệu (Cần sửa nếu msg không phải là Twist)
         v = msg.linear.x
         w = msg.angular.z
         
@@ -72,72 +58,82 @@ class TrajectoryRecorder(Node):
         
         self.trajectory_data.append((self.pose_x, self.pose_y))
         self.last_time = current_time
+        # ---------------------------------------------------------
 
-    def print_performance_report(self):
-        """In ra Báo cáo chi phí tính toán của máy tính."""
-        total_time = time.time() - self.start_time
-        print("\n" + "="*50)
-        print("📊 BÁO CÁO CHI PHÍ TÍNH TOÁN CỦA MÁY TÍNH")
-        print("="*50)
-        print(f"⏱️ Tổng thời gian chạy ghi nhận: {total_time:.2f} giây")
+        # 2. Kết thúc đo thời gian CPU
+        t_end = time.process_time()
+        cpu_time_ms = (t_end - t_start) * 1000.0 # Đổi ra mili-giây
+        
+        # Lọc nhiễu (chỉ ghi nhận nếu thực sự có tốn time > 0)
+        if cpu_time_ms > 0:
+            self.process_time_records.append(cpu_time_ms)
 
-        if len(self.cpu_records) > 0:
-            avg_cpu = sum(self.cpu_records) / len(self.cpu_records)
-            max_cpu = max(self.cpu_records)
-            avg_ram = sum(self.ram_records) / len(self.ram_records)
-            max_ram = max(self.ram_records)
+        # 3. Lấy mẫu bộ nhớ RAM (RSS: Resident Set Size) tính bằng MB
+        # Lấy định kỳ mỗi 10 step để tránh overhead hệ thống
+        if len(self.trajectory_data) % 10 == 0:
+            mem_mb = self.current_process.memory_info().rss / (1024 * 1024)
+            self.memory_mb_records.append(mem_mb)
 
-            print(f"💻 CPU Usage - Trung bình: {avg_cpu:.1f}% | Chạm đỉnh (Max): {max_cpu:.1f}%")
-            print(f"🧠 RAM Usage - Trung bình: {avg_ram:.1f}% | Chạm đỉnh (Max): {max_ram:.1f}%")
+    def save_to_csv_and_report(self):
+        print("\n" + "="*60)
+        print("📊 BÁO CÁO CHI PHÍ TÍNH TOÁN KHÁCH QUAN (PROCESS-LEVEL)")
+        print("="*60)
+        
+        if len(self.process_time_records) > 0:
+            avg_time = sum(self.process_time_records) / len(self.process_time_records)
+            max_time = max(self.process_time_records)
+            min_time = min(self.process_time_records)
+            
+            print(f"⏱️ THỜI GIAN CPU (Process Time) trên mỗi vòng lặp:")
+            print(f"   - Trung bình  : {avg_time:.4f} ms")
+            print(f"   - Nhanh nhất  : {min_time:.4f} ms")
+            print(f"   - Chậm nhất   : {max_time:.4f} ms")
+            print(f"   -> AI thường có Min/Max gần nhau. Truyền thống thường có Min/Max chênh lệch lớn.")
         else:
-            print("⚠️ Chưa thu thập đủ mẫu CPU/RAM (Thời gian chạy dưới 1 giây).")
-        print("="*50)
+            print("⚠️ Không đo được thời gian CPU (có thể thuật toán chạy quá nhanh hoặc chưa nhận data).")
 
-    def save_to_csv(self):
-        """Dùng print tiêu chuẩn thay vì logger của ROS 2 để tránh crash lúc tắt máy"""
-        print("\n--- Đang xử lý dữ liệu đầu ra ---")
+        print("-" * 60)
         
-        # 1. In báo cáo tài nguyên hệ thống
-        self.print_performance_report()
-        
-        # 2. Lưu file CSV
+        if len(self.memory_mb_records) > 0:
+            avg_mem = sum(self.memory_mb_records) / len(self.memory_mb_records)
+            max_mem = max(self.memory_mb_records)
+            
+            print(f"🧠 BỘ NHỚ RAM (Resident Set Size):")
+            print(f"   - Dung lượng trung bình: {avg_mem:.2f} MB")
+            print(f"   - Dung lượng đỉnh (Max): {max_mem:.2f} MB")
+        else:
+            print("⚠️ Không có dữ liệu RAM.")
+            
+        print("="*60)
+
+        # Lưu file CSV
         if len(self.trajectory_data) > 1:
             try:
                 with open(self.output_file, mode='w', newline='') as file:
                     writer = csv.writer(file)
                     writer.writerows(self.trajectory_data)
-                print(f"[THÀNH CÔNG] Đã lưu {len(self.trajectory_data)-1} điểm tọa độ vào '{self.output_file}'\n")
+                print(f"\n[THÀNH CÔNG] Đã lưu quỹ đạo vào '{self.output_file}'")
             except Exception as e:
-                print(f"[LỖI] Không thể lưu file CSV: {e}\n")
-        else:
-            print("[CẢNH BÁO] Không nhận được dữ liệu nào từ topic. Kiểm tra lại topic_name.\n")
-
+                print(f"\n[LỖI] Không thể lưu file CSV: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
-    
-    parser = argparse.ArgumentParser(description='Ghi quỹ đạo robot và theo dõi tài nguyên ra file CSV.')
-    parser.add_argument('--topic', type=str, default='/wheel_data', help='Tên topic lắng nghe')
-    parser.add_argument('--output', type=str, required=True, help='Tên file CSV đầu ra (VD: algo1.csv)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--topic', type=str, default='/wheel_data')
+    parser.add_argument('--output', type=str, required=True)
     
     parsed_args, _ = parser.parse_known_args(sys.argv[1:])
-    
-    recorder = TrajectoryRecorder(topic_name=parsed_args.topic, output_file=parsed_args.output)
+    recorder = ObjectiveTrajectoryRecorder(topic_name=parsed_args.topic, output_file=parsed_args.output)
     
     try:
         rclpy.spin(recorder)
     except KeyboardInterrupt:
-        # Bỏ qua lỗi ngắt bàn phím để đi thẳng xuống finally
         pass
     finally:
-        # Lưu file trước khi destroy node
-        recorder.save_to_csv()
-        
-        # Rút gọn tắt máy an toàn
+        recorder.save_to_csv_and_report()
         if rclpy.ok():
             recorder.destroy_node()
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
