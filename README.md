@@ -6,4 +6,4 @@ python3 algorithm_benchmark.py --algo_name DWB --keyword controller_server --whe
 
 ``bash
 python3 algorithm_benchmark.py --algo_name HG_DAGGER --keyword scripts.inference --wheel_topic /wheel_data --cmd_topic /cmd_vel
-``
+```
